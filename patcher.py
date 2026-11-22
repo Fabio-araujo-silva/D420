@@ -51,14 +51,6 @@ def find_all(data: bytes, sig: str) -> list[int]:
     return [m.start() for m in re.finditer(b"(?=" + pat + b")", data)]
 
 
-def sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 # ---------- perfis ----------
 
 def load_profiles(only: str | None = None) -> list[dict]:
@@ -104,7 +96,7 @@ def evaluate(install_dir: str, profile: dict) -> dict | None:
         entry["sha256"] = None
         if "sha256_original" in t:
             expected = t["sha256_original"]
-            cur = sha256(path)
+            cur = hashlib.sha256(data).hexdigest()
             entry["sha256"] = cur
             entry["sha_ok"] = (cur == expected)
         result["targets"].append(entry)
@@ -167,9 +159,13 @@ def _lock_ok(path: str) -> bool:
         return False
 
 
-def _apply(install_dir: str, profile: dict, want: str) -> int:
-    """want: 'patched' para aplicar, 'original' para reverter."""
+def _apply(install_dir: str, profile: dict, want: str, force: bool = False) -> int:
+    """want: 'patched' para aplicar, 'original' para reverter.
+    Três fases: (1) prepara tudo em memória e valida backups — nenhuma
+    escrita acontece ainda; (2) grava backups faltantes; (3) escrita
+    atômica (tmp + os.replace) com rollback em memória se algo falhar."""
     from_state, to_state = ("original", "patched") if want == "patched" else ("patched", "original")
+    prof_by_name = {x["name"]: x for x in profile["target"]}
     r = evaluate(install_dir, profile)
     todo = []
     for t in r["targets"]:
@@ -182,33 +178,56 @@ def _apply(install_dir: str, profile: dict, want: str) -> int:
     if not todo:
         print(f"nada a fazer: ja esta '{to_state}'.")
         return 0
-    # trava: nenhum arquivo pode estar em uso
     for t in todo:
         if not _lock_ok(t["path"]):
             print(f"ERRO: {t['file']} esta em uso (o Resolve esta aberto?).")
             return 1
-    # backup unico por arquivo
+
+    # fase 1: staging — valida backup existente e computa novos bytes
+    staged = []  # (target, old_bytes, new_bytes, bak_path)
     for t in todo:
+        pt = prof_by_name[t["name"]]
+        find_sig = pt["sig"] if want == "patched" else pt["patched"]
+        repl, _ = parse_sig(pt["patched"] if want == "patched" else pt["sig"])
         bak = t["path"] + BACKUP_SUFFIX
+        old = open(t["path"], "rb").read()
+        if os.path.exists(bak):
+            bdata = open(bak, "rb").read()
+            if not force and len(find_all(bdata, pt["sig"])) != 1:
+                print(f"ERRO: o backup existente de {t['file']} nao contem a "
+                      f"assinatura original — backup desconfiado, nada foi tocado. "
+                      f"Restaure o arquivo manualmente e apague o backup, ou use --force.")
+                return 1
+        at = find_all(old, find_sig)[0]
+        new = bytearray(old)
+        new[at:at + len(repl)] = repl
+        staged.append((t, old, bytes(new), bak, at))
+
+    # fase 2: backups que ainda não existem (estado atual == original)
+    for t, old, new, bak, at in staged:
         if not os.path.exists(bak):
-            with open(t["path"], "rb") as src, open(bak, "wb") as dst:
-                dst.write(src.read())
+            with open(bak, "wb") as fh:
+                fh.write(old)
             print(f"backup: {os.path.basename(bak)}")
-    for t in todo:
-        prof_t = next(x for x in profile["target"] if x["name"] == t["name"])
-        data = bytearray(open(t["path"], "rb").read())
-        if want == "patched":
-            at = find_all(bytes(data), prof_t["sig"])[0]
-            new, _ = parse_sig(prof_t["patched"])
-            data[at:at + len(new)] = new
-        else:
-            at = find_all(bytes(data), prof_t["patched"])[0]
-            new, _ = parse_sig(prof_t["sig"])
-            data[at:at + len(new)] = new
-        with open(t["path"], "wb") as fh:
-            fh.write(data)
+
+    # fase 3: escrita atômica, com rollback dos já gravados em caso de falha
+    done = []
+    for t, old, new, bak, at in staged:
+        tmp = t["path"] + ".resolve-unlocked.tmp"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(new)
+            os.replace(tmp, t["path"])
+        except OSError as exc:
+            print(f"ERRO ao escrever {t['file']}: {exc}. Revertendo "
+                  f"{len(done)} arquivo(s) desta operacao.")
+            for d_t, d_old, _, _, _ in done:
+                with open(d_t["path"], "wb") as fh:
+                    fh.write(d_old)
+            return 1
         verb = "patcheado" if want == "patched" else "revertido"
         print(f"{verb}: {t['file']} :: {t['name']} (offset {at:#x})")
+        done.append((t, old, new, bak, at))
     return 0
 
 
@@ -217,6 +236,8 @@ def main(argv=None) -> int:
     ap.add_argument("cmd", choices=["detect", "status", "patch", "unpatch"])
     ap.add_argument("--dir", required=True, help="pasta de instalacao do Resolve")
     ap.add_argument("--profile", help="forca um perfil (ex.: 21.2)")
+    ap.add_argument("--force", action="store_true",
+                    help="ignora backup existente desconfiado (use com atencao)")
     args = ap.parse_args(argv)
 
     if not os.path.isdir(args.dir):
@@ -240,9 +261,9 @@ def main(argv=None) -> int:
     if args.cmd == "status":
         return cmd_report(args.dir, profile)
     if args.cmd == "patch":
-        return _apply(args.dir, profile, "patched")
+        return _apply(args.dir, profile, "patched", force=args.force)
     if args.cmd == "unpatch":
-        return _apply(args.dir, profile, "original")
+        return _apply(args.dir, profile, "original", force=args.force)
     return 1
 
 
