@@ -1,0 +1,21 @@
+# resolve-unlocked — DaVinci Resolve 21.2
+# Perfil gerado a partir da instalação real extraída do MSI (21.2, Windows x64).
+
+version = "21.2"
+
+[[target]]
+file = "fusionsystem.dll"
+name = "IsStudio -> sempre true"
+# Stub de entrada de Fusion::FusionApp::IsStudio (exportada, RVAs 0x309830):
+#   mov r8,rdx / mov rdx,rcx / lea rcx,[rip+..] / jmp <impl>
+sig     = "4c8bc2488bd1488d0d33acff01e9ce941800"
+# Patch: mov eax,1 ; ret  (os 12 bytes seguintes viram alcance morto)
+patched = "b801000000c3488d0d33acff01e9ce941800"
+sha256_original = "c91629a33b5fad85ec681d1f01ea9b92939c4d71cf81a844c4391165cc94e99a"
+description = """
+Fusion::FusionApp::IsStudio() lê um byte-flag (offset 0x73A do objeto global
+do app Fusion) e devolve como bool. A UI (FusionPage.dll) importa essa função
+pelo nome para ligar/desligar recursos da edição paga. Forçando o retorno em
+1, os portões de recurso do motor assumem edição Studio.
+Não remove janelas de aviso de ativação nem mexe em checagens de nuvem.
+"""
